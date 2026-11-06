@@ -1,0 +1,16 @@
+{
+  "repository": "https://github.com/Yuan-Liu-01/M3Diff.git",
+  "code_commit": "4e346e52185620ec6fa17235d93b0c26a9d47a71",
+  "model": {
+    "repo_id": "IVC-liuyuan/M3Diff",
+    "revision": "d6a8880dc789b0816660278c087ac9ebdfe18dd0"
+  },
+  "dataset": {
+    "repo_id": "IVC-liuyuan/OmniDiff",
+    "revision": "ed4a84cc51912c73e3d54c8643256d9469657552"
+  },
+  "vision": {
+    "repo_id": "google/siglip-so400m-patch14-384",
+    "revision": "9fdffc58afc957d1a03a25b10dba0329ab15c2a3"
+  }
+}
