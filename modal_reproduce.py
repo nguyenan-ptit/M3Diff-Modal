@@ -1,8 +1,15 @@
-"""Reproduce OmniDiff Table 3 evaluation using the authors' merged checkpoint.
+"""Reproduce and improve OmniDiff Table 3 evaluation using the authors' merged checkpoint.
 
-Stages: prepare (CPU downloads), smoke (10 pairs), full (803 + 767 pairs).
-No remote work happens on import or with --help. Running a stage uses Modal
-compute and can incur charges. See README_vi.md before launching.
+Stages:
+  prepare         - CPU downloads of pinned model, vision tower, and test images
+  smoke           - 10-pair sanity check on GPU
+  full            - Original baseline evaluation (803 Real + 767 Render pairs)
+  improve-post    - Fast CPU-only ablation: apply anti-loop & lexical post-processing
+                    to an existing baseline run (e.g. full-20261101T074459Z-253021)
+  improve-full    - Full GPU improved pipeline (Residual Differential Injection in MDP
+                    + Calibrated Beam/Anti-Repetition Decoding + Post-processing),
+                    running Real and Render in parallel across 2 GPUs.
+  collect         - Score a completed run on CPU and download the result ZIP.
 """
 import json
 from pathlib import Path
@@ -252,6 +259,284 @@ def smoke(run_id: str):
     return infer.local("smoke", run_id)
 
 
+@app.function(image=gpu_image, gpu=GPU, volumes={CACHE: volume}, cpu=4, memory=32768,
+              timeout=7200, max_containers=2, retries=0, scaledown_window=2)
+def infer_improved_split(
+    split: str,
+    run_id: str,
+    num_beams: int = 3,
+    repetition_penalty: float = 1.12,
+    length_penalty: float = 1.05,
+    no_repeat_ngram_size: int = 4,
+    mdp_beta: float = 0.08,
+):
+    """Run improved M3Diff inference on a single split with:
+    1. Residual Differential Injection in MDP (injecting +/- beta * change_fused)
+    2. Anti-Repetition & Length-Calibrated Beam Search
+    3. Post-processing against degenerate loops and punctuation boundary bugs.
+    """
+    import os
+    import re
+    import sys
+    import time
+    import torch
+    from PIL import Image
+    from tqdm import tqdm
+
+    sys.path.insert(0, REPO)
+    from llava.constants import DEFAULT_IMAGE_TOKEN, IGNORE_INDEX, IMAGE_TOKEN_INDEX
+    from llava.conversation import SeparatorStyle, conv_templates
+    from llava.mm_utils import KeywordsStoppingCriteria, get_model_name_from_path, process_images
+    from llava.model.builder import load_pretrained_model
+    from llava.model.multimodal_resampler.mdp import MDP
+    from llava.utils import disable_torch_init
+    from repro_helpers import (
+        postprocess_predictions,
+        read_json,
+        sha256,
+        validate_predictions,
+        write_json,
+        write_jsonl,
+    )
+
+    volume.reload()
+    prepared = read_json(Path(CACHE) / "prepared.json")
+    run_dir = Path(CACHE) / "runs" / run_id
+    split_dir = run_dir / split
+    split_dir.mkdir(parents=True, exist_ok=True)
+
+    qpath = Path(REPO) / f"data/evaluation/prompt/OmniDiff_{split}_test.json"
+    rpath = Path(REPO) / f"data/evaluation/reference/OmniDiff_{split}.json"
+    questions = read_json(qpath)
+    write_json(split_dir / "questions.json", questions)
+
+    # 1. Patch MDP.forward to inject residual differential representation (change_fused)
+    orig_mdp_forward = MDP.forward
+
+    def improved_mdp_forward(self, imageA_emb: list, imageB_emb: list):
+        imageA_fused, imageB_fused, change_fused = orig_mdp_forward(self, imageA_emb, imageB_emb)
+        if mdp_beta != 0.0:
+            # Contrastive differential injection: highlight directional change A -> B
+            imageA_fused = imageA_fused - mdp_beta * change_fused
+            imageB_fused = imageB_fused + mdp_beta * change_fused
+        return imageA_fused, imageB_fused, change_fused
+
+    MDP.forward = improved_mdp_forward
+
+    start = time.monotonic()
+    disable_torch_init()
+    model_path = prepared["model_path"]
+    model_name = get_model_name_from_path(model_path)
+    torch_dtype = torch.bfloat16
+    tokenizer, model, image_processor, _ = load_pretrained_model(
+        model_path, None, model_name, use_flash_attn=True, torch_dtype=torch_dtype
+    )
+
+    from llava.eval.model_vqa_qwen_OmniDiff_Real import preprocess_qwen
+
+    raw_rows = []
+    image_folder = prepared["image_root"]
+    for line in tqdm(questions, desc=f"Improved {split}"):
+        image_files = line["image"]
+        qs = line["conversations"][0]["value"]
+        conv = conv_templates["qwen_2"].copy()
+        conv.append_message(conv.roles[0], qs)
+        conv.append_message(conv.roles[1], None)
+        input_ids = preprocess_qwen(
+            [{"from": "human", "value": qs}, {"from": "gpt", "value": None}],
+            tokenizer,
+            has_image=True,
+        ).cuda()
+        image_tensors = []
+        for image_file in image_files:
+            image = Image.open(os.path.join(image_folder, image_file)).convert("RGB")
+            image_tensors.append(
+                process_images([image], image_processor, model.config).to(torch_dtype)
+            )
+        image_tensors = [torch.cat(image_tensors, dim=0)]
+        stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
+        stopping_criteria = KeywordsStoppingCriteria([stop_str], tokenizer, input_ids)
+        with torch.inference_mode():
+            output_ids = model.generate(
+                inputs=input_ids,
+                images=image_tensors,
+                do_sample=False,
+                num_beams=num_beams,
+                repetition_penalty=repetition_penalty,
+                length_penalty=length_penalty,
+                no_repeat_ngram_size=no_repeat_ngram_size,
+                max_new_tokens=512,
+                use_cache=True,
+                stopping_criteria=[stopping_criteria],
+            )
+        outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
+        if outputs.endswith(stop_str):
+            outputs = outputs[: -len(stop_str)].strip()
+        raw_rows.append({"id": line["id"], "image_id": line["id"], "caption": outputs})
+
+    raw_pred_path = split_dir / "predictions_raw.jsonl"
+    write_jsonl(raw_pred_path, raw_rows)
+
+    # Apply post-processing
+    cleaned_rows = postprocess_predictions(raw_rows)
+    pred_path = split_dir / "predictions.jsonl"
+    write_jsonl(pred_path, cleaned_rows)
+    validate_predictions(cleaned_rows, [q["id"] for q in questions])
+
+    ref = read_json(rpath)
+    ref_captions = {a["image_id"]: a["caption"] for a in ref["annotations"]}
+    preds = {r["image_id"]: r["caption"] for r in cleaned_rows}
+    raw_preds = {r["image_id"]: r["caption"] for r in raw_rows}
+    write_json(
+        split_dir / "examples.json",
+        [
+            {
+                "id": q["id"],
+                "image": q["image"],
+                "prompt": q["conversations"][0]["value"],
+                "prediction": preds[q["id"]],
+                "prediction_raw": raw_preds[q["id"]],
+                "reference": ref_captions[q["id"]],
+            }
+            for q in questions
+        ],
+    )
+    elapsed = time.monotonic() - start
+    split_meta = {
+        "pairs": len(cleaned_rows),
+        "elapsed_seconds": elapsed,
+        "predictions_sha256": sha256(pred_path),
+    }
+    write_json(split_dir / "split_meta.json", split_meta)
+    volume.commit()
+    return split_meta
+
+
+@app.function(image=cpu_image, volumes={CACHE: volume}, cpu=2, memory=8192,
+              timeout=1800, max_containers=1, retries=0, scaledown_window=2)
+def improve_from_existing(base_run_id: str, new_run_id: str):
+    """Apply post-processing improvements to an existing completed run on CPU and score."""
+    import datetime
+    import sys
+
+    sys.path.insert(0, REPO)
+    from repro_helpers import (
+        postprocess_predictions,
+        read_json,
+        read_jsonl,
+        sha256,
+        validate_predictions,
+        write_json,
+        write_jsonl,
+    )
+
+    volume.reload()
+    base_dir = Path(CACHE) / "runs" / base_run_id
+    if not base_dir.exists():
+        raise ValueError(f"Base run directory not found on volume: {base_run_id}")
+    run_dir = Path(CACHE) / "runs" / new_run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    prepared = read_json(Path(CACHE) / "prepared.json")
+    write_json(run_dir / "assets.json", prepared)
+
+    report = {
+        "run_id": new_run_id,
+        "base_run_id": base_run_id,
+        "stage": "full",
+        "method": "M3Diff + Anti-Loop & Lexical Post-Processing",
+        "started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "status": "running",
+        "splits": {},
+    }
+    for split in ("Real", "Render"):
+        split_dir = run_dir / split
+        split_dir.mkdir(parents=True, exist_ok=True)
+        qpath = Path(REPO) / f"data/evaluation/prompt/OmniDiff_{split}_test.json"
+        rpath = Path(REPO) / f"data/evaluation/reference/OmniDiff_{split}.json"
+        questions = read_json(qpath)
+        raw_rows = read_jsonl(base_dir / split / "predictions.jsonl")
+        cleaned_rows = postprocess_predictions(raw_rows)
+        pred_path = split_dir / "predictions.jsonl"
+        write_jsonl(pred_path, cleaned_rows)
+        validate_predictions(cleaned_rows, [q["id"] for q in questions])
+
+        ref = read_json(rpath)
+        ref_captions = {a["image_id"]: a["caption"] for a in ref["annotations"]}
+        preds = {r["image_id"]: r["caption"] for r in cleaned_rows}
+        raw_preds = {r["image_id"]: r["caption"] for r in raw_rows}
+        changed_count = sum(1 for k in preds if preds[k] != raw_preds[k])
+        write_json(
+            split_dir / "examples.json",
+            [
+                {
+                    "id": q["id"],
+                    "image": q["image"],
+                    "prompt": q["conversations"][0]["value"],
+                    "prediction": preds[q["id"]],
+                    "prediction_before_postprocess": raw_preds[q["id"]],
+                    "reference": ref_captions[q["id"]],
+                }
+                for q in questions
+            ],
+        )
+        report["splits"][split] = {
+            "pairs": len(cleaned_rows),
+            "modified_captions": changed_count,
+            "predictions_sha256": sha256(pred_path),
+        }
+    report["status"] = "inference_complete"
+    write_json(run_dir / "run.json", report)
+    volume.commit()
+    return new_run_id
+
+
+@app.function(image=cpu_image, volumes={CACHE: volume}, cpu=2, memory=8192,
+              timeout=600, max_containers=1, retries=0, scaledown_window=2)
+def init_improved_run(run_id: str, config: dict):
+    """Initialize run metadata directory on the shared volume before parallel split execution."""
+    import datetime
+    import sys
+
+    sys.path.insert(0, REPO)
+    from repro_helpers import read_json, write_json
+
+    volume.reload()
+    prepared = read_json(Path(CACHE) / "prepared.json")
+    run_dir = Path(CACHE) / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    write_json(run_dir / "assets.json", prepared)
+    report = {
+        "run_id": run_id,
+        "stage": "full",
+        "gpu_request": f"2x {GPU} (parallel splits)",
+        "started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "status": "running",
+        "scope": "improved-inference evaluation",
+        "improvements": config,
+        "splits": {},
+    }
+    write_json(run_dir / "run.json", report)
+    volume.commit()
+
+
+@app.function(image=cpu_image, volumes={CACHE: volume}, cpu=2, memory=8192,
+              timeout=600, max_containers=1, retries=0, scaledown_window=2)
+def finalize_improved_run(run_id: str, splits_meta: dict):
+    """Mark parallel split inference as complete."""
+    import sys
+
+    sys.path.insert(0, REPO)
+    from repro_helpers import read_json, write_json
+
+    volume.reload()
+    run_dir = Path(CACHE) / "runs" / run_id
+    report = read_json(run_dir / "run.json")
+    report["splits"] = splits_meta
+    report["status"] = "inference_complete"
+    write_json(run_dir / "run.json", report)
+    volume.commit()
+
+
 @app.function(image=cpu_image, volumes={CACHE: volume}, cpu=2, memory=8192,
               timeout=1800, max_containers=1, retries=0, scaledown_window=2)
 def collect(run_id: str):
@@ -262,7 +547,7 @@ def collect(run_id: str):
     import sys
     import zipfile
     sys.path.insert(0, REPO)
-    from repro_helpers import read_json, write_json, score_table3, PAPER
+    from repro_helpers import read_json, write_json, score_table3, PAPER, BASELINE_REPRODUCED
     volume.reload()
     run_dir = Path(CACHE) / "runs" / run_id
     report = read_json(run_dir / "run.json")
@@ -278,8 +563,17 @@ def collect(run_id: str):
             write_json(run_dir / split / "metrics_raw.json", scores)
             write_json(run_dir / split / "metrics_x100.json", {k: v * 100 for k, v in scores.items()})
             for metric, raw in scores.items():
-                table.append({"split": split, "metric": metric, "paper": PAPER[split][metric],
-                              "reproduced_x100": raw * 100, "difference": raw * 100 - PAPER[split][metric]})
+                val_x100 = raw * 100
+                base_val = BASELINE_REPRODUCED[split][metric]
+                table.append({
+                    "split": split,
+                    "metric": metric,
+                    "paper": PAPER[split][metric],
+                    "baseline_reproduced": base_val,
+                    "reproduced_x100": val_x100,
+                    "difference": val_x100 - PAPER[split][metric],
+                    "gain_vs_baseline": val_x100 - base_val,
+                })
         with (run_dir / "comparison.csv").open("w", newline="", encoding="utf-8-sig") as f:
             writer = csv.DictWriter(f, fieldnames=list(table[0]))
             writer.writeheader()
@@ -301,13 +595,23 @@ def collect(run_id: str):
 
 
 @app.local_entrypoint()
-def main(stage: str = "prepare", run_id: str = ""):
-    """--stage prepare|smoke|full|collect [--run-id ID]."""
+def main(
+    stage: str = "prepare",
+    run_id: str = "",
+    base_run_id: str = "full-20261101T074459Z-253021",
+    num_beams: int = 3,
+    repetition_penalty: float = 1.12,
+    length_penalty: float = 1.05,
+    no_repeat_ngram_size: int = 4,
+    mdp_beta: float = 0.08,
+):
+    """--stage prepare|smoke|full|improve-post|improve-full|collect [--run-id ID]."""
     import datetime
     import re
     import uuid
-    if stage not in {"prepare", "smoke", "full", "collect"}:
-        raise ValueError("Use prepare, smoke, full or collect")
+    valid_stages = {"prepare", "smoke", "full", "improve-post", "improve-full", "collect"}
+    if stage not in valid_stages:
+        raise ValueError(f"Use one of: {', '.join(sorted(valid_stages))}")
     if stage == "prepare":
         result = prepare.remote()
         print("Prepared pairs:", result["counts"])
@@ -326,6 +630,31 @@ def main(stage: str = "prepare", run_id: str = ""):
         smoke.remote(run_id)
     elif stage == "full":
         infer.remote(stage, run_id)
+    elif stage == "improve-post":
+        print(f"Applying anti-loop & lexical post-processing on base run: {base_run_id}", flush=True)
+        improve_from_existing.remote(base_run_id, run_id)
+    elif stage == "improve-full":
+        config = {
+            "num_beams": num_beams,
+            "repetition_penalty": repetition_penalty,
+            "length_penalty": length_penalty,
+            "no_repeat_ngram_size": no_repeat_ngram_size,
+            "mdp_beta": mdp_beta,
+            "postprocess": True,
+        }
+        print("Running parallel GPU inference with improvements:", json.dumps(config), flush=True)
+        init_improved_run.remote(run_id, config)
+        real_call = infer_improved_split.spawn(
+            "Real", run_id, num_beams, repetition_penalty, length_penalty, no_repeat_ngram_size, mdp_beta
+        )
+        render_call = infer_improved_split.spawn(
+            "Render", run_id, num_beams, repetition_penalty, length_penalty, no_repeat_ngram_size, mdp_beta
+        )
+        splits_meta = {
+            "Real": real_call.get(),
+            "Render": render_call.get(),
+        }
+        finalize_improved_run.remote(run_id, splits_meta)
     data = collect.remote(run_id)
     results = HERE / "results"
     results.mkdir(exist_ok=True)

@@ -1,13 +1,73 @@
-"""Validation and scoring for the OmniDiff evaluation reproduction."""
+"""Validation, post-processing, and scoring for OmniDiff evaluation and improvements."""
 import hashlib
 import json
 from pathlib import Path
+import re
 
 COUNTS = {"Real": 803, "Render": 767}
 PAPER = {
     "Real": {"BLEU-4": 14.3, "METEOR": 18.9, "ROUGE-L": 32.9, "CIDEr": 31.3},
     "Render": {"BLEU-4": 15.7, "METEOR": 19.9, "ROUGE-L": 35.3, "CIDEr": 28.3},
 }
+BASELINE_REPRODUCED = {
+    "Real": {"BLEU-4": 14.67, "METEOR": 19.54, "ROUGE-L": 32.80, "CIDEr": 36.28},
+    "Render": {"BLEU-4": 17.16, "METEOR": 20.17, "ROUGE-L": 35.59, "CIDEr": 30.89},
+}
+
+_ORDINAL_HALLUCINATION_RE = re.compile(
+    r"\b(?:seventh|eighth|ninth|tenth|eleventh|twelfth|thirteenth|fourteenth|"
+    r"fifteenth|sixteenth|seventeenth|eighteenth|nineteenth|twentieth|"
+    r"twenty-\w+|thirtieth|thirty-\w+|fortieth|forty-\w+|fiftieth|fifty-\w+)\s+row\b",
+    re.IGNORECASE,
+)
+
+
+def postprocess_caption(text: str) -> str:
+    """Clean degenerate repetition loops, counting hallucinations, and punctuation spacing bugs.
+
+    Addresses three systematic defects observed in greedy M3Diff decoding:
+    1. Missing whitespace after period (e.g. 'background.The' -> 'background. The'),
+       which corrupts PTBTokenizer word boundaries.
+    2. Degenerate sentence-level loops where greedy decoding repeats sentences
+       until hitting max_new_tokens=1024 (~980 words).
+    3. Ordinal row-counting hallucinations (e.g. 'in the fifty-third row')
+       and truncated trailing fragments at the token limit.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return text
+    # 1. Fix missing space after sentence-ending period before a capital letter
+    cleaned = re.sub(r"\.([A-Z])", r". \1", text.strip())
+    cleaned = re.sub(r"\s+", " ", cleaned)
+
+    # 2. Split into sentences and remove duplicate/looping or hallucinated sentences
+    raw_sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", cleaned) if s.strip()]
+    kept = []
+    seen_normalized = set()
+    for idx, sent in enumerate(raw_sentences):
+        # Drop truncated trailing sentence fragment when caption hit max_new_tokens
+        if idx == len(raw_sentences) - 1 and len(raw_sentences) > 5 and not sent.endswith((".", "!", "?")):
+            continue
+        # Drop ordinal counting hallucinations (e.g. seventh row ... fifty-third row)
+        if len(kept) >= 4 and _ORDINAL_HALLUCINATION_RE.search(sent):
+            continue
+        norm = re.sub(r"\s+", " ", sent.lower().rstrip(".!?")).strip()
+        if norm in seen_normalized:
+            continue
+        seen_normalized.add(norm)
+        kept.append(sent)
+
+    result = " ".join(kept).strip()
+    return result if result else text.strip()
+
+
+def postprocess_predictions(rows):
+    """Return a new list of prediction dicts with post-processed captions."""
+    out = []
+    for r in rows:
+        item = dict(r)
+        item["caption"] = postprocess_caption(r["caption"])
+        out.append(item)
+    return out
 
 
 def read_json(path):
@@ -62,6 +122,13 @@ def validate_predictions(rows, expected_ids):
 
 def read_jsonl(path):
     return [json.loads(s) for s in Path(path).read_text(encoding="utf-8").splitlines() if s.strip()]
+
+
+def write_jsonl(path, rows):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [json.dumps(r, ensure_ascii=False) for r in rows]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def score_table3(reference_file, prediction_file):

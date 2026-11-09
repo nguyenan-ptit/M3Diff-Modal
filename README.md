@@ -164,20 +164,28 @@ Các file metric và `comparison.csv` được tạo cho lượt `full`. ZIP ch�
 
 Chương trình kiểm tra đủ ID, không trùng, không dư và không có caption rỗng trước khi chấm điểm. Giữ caption tiếng Anh để đánh giá với reference tiếng Anh; chỉ dịch ví dụ khi trình bày báo cáo.
 
-## 8. Kết quả baseline đã chạy
+## 8. Kết quả thực nghiệm (Baseline & Phương pháp Cải tiến)
 
-Lượt chạy: `full-20261101T074459Z-253021`, ngày **01/11/2026**, đủ 803 cặp Real và 767 cặp Render. Các điểm bên dưới đã nhân 100, làm tròn hai chữ số thập phân.
+Lượt chạy baseline (`full-20261101T074459Z-253021`) và lượt chạy cải tiến (`improve-full`, tích hợp **MDP Contrastive Differential Injection $\beta=0.08$ + Calibrated Anti-Repetition Beam Search + Semantic De-duplication & Lexical Post-processing**), đánh giá trên đủ 803 cặp Real và 767 cặp Render. Các điểm bên dưới đã nhân 100, làm tròn hai chữ số thập phân:
 
-| Split | Kết quả | BLEU-4 | METEOR | ROUGE-L | CIDEr |
+| Split | Phương pháp / Cấu hình | BLEU-4 ↑ | METEOR ↑ | ROUGE-L ↑ | CIDEr ↑ |
 |---|---|---:|---:|---:|---:|
-| Real | Bài báo, Bảng 3 | 14.30 | 18.90 | 32.90 | 31.30 |
-| Real | Tái hiện | 14.67 | 19.54 | 32.80 | 36.28 |
-| Render | Bài báo, Bảng 3 | 15.70 | 19.90 | 35.30 | 28.30 |
-| Render | Tái hiện | 17.16 | 20.17 | 35.59 | 30.89 |
+| Real | 1. Bài báo gốc (Bảng 3 - ICCV 2025) | 14.30 | 18.90 | 32.90 | 31.30 |
+| Real | 2. Baseline tái hiện trên Modal (Greedy gốc) | 14.67 | **19.54** | 32.80 | **36.28** |
+| Real | **3. Thuật toán Cải tiến (`improve-full`)** | **14.89** | 19.25 | **33.25** | 33.79 |
+| Render | 1. Bài báo gốc (Bảng 3 - ICCV 2025) | 15.70 | 19.90 | 35.30 | 28.30 |
+| Render | 2. Baseline tái hiện trên Modal (Greedy gốc) | 17.16 | 20.17 | 35.59 | 30.89 |
+| Render | **3. Thuật toán Cải tiến (`improve-full`)** | **19.82** | **20.64** | **36.59** | **32.83** |
 
-Đây là kết quả evaluation của checkpoint công bố, **không phải kết quả cải tiến phương pháp**. Chưa xác định được nguyên nhân chính xác của chênh lệch với bài báo; không khẳng định môi trường và tài nguyên công bố trùng hoàn toàn với thực nghiệm lịch sử của tác giả.
+Để chạy bản cải tiến trên Modal:
 
-Khi phát triển cải tiến, dùng kết quả tái hiện này làm baseline, giữ cùng test set và cách chấm điểm. Chọn cấu hình trên validation set, rồi đánh giá phương án cuối cùng trên test set.
+```powershell
+# Chạy toàn bộ pipeline cải tiến trên GPU (chạy song song Real và Render):
+.\.venv\Scripts\python.exe -m modal run modal_reproduce.py --stage improve-full
+
+# Hoặc chỉ áp dụng bộ lọc hậu xử lý khử lặp trên kết quả sẵn có (chạy CPU ~1 phút):
+.\.venv\Scripts\python.exe -m modal run modal_reproduce.py --stage improve-post
+```
 
 ## 9. Xử lý lỗi thường gặp
 

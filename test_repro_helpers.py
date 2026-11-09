@@ -14,7 +14,13 @@ from pathlib import Path
 import sys
 import unittest
 
-from repro_helpers import COUNTS, read_json, validate_predictions, validate_questions
+from repro_helpers import (
+    COUNTS,
+    postprocess_caption,
+    read_json,
+    validate_predictions,
+    validate_questions,
+)
 
 DEFAULT_REPO = Path(__file__).resolve().parents[2] / "work" / "M3Diff"
 REPO = Path(os.environ.get("M3DIFF_REPO", str(DEFAULT_REPO))).expanduser().resolve()
@@ -71,6 +77,18 @@ class PredictionIntegrityTests(unittest.TestCase):
     def test_empty_file_is_not_full_test_success(self):
         with self.assertRaisesRegex(ValueError, "coverage"):
             validate_predictions([], self.expected)
+
+    def test_postprocess_caption_removes_loops_and_fixes_period_spacing(self):
+        raw = (
+            "The scene has become brighter.The pillow moved left. "
+            "The cushion disappeared. The cushion disappeared. "
+            "The cushion disappeared. Truncated tail without period"
+        )
+        cleaned = postprocess_caption(raw)
+        self.assertEqual(
+            cleaned,
+            "The scene has become brighter. The pillow moved left. The cushion disappeared.",
+        )
 
 
 class OfficialEvaluationDataTests(unittest.TestCase):
